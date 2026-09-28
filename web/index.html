@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>计算机系统基础 · 阅读器</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">计算机系统基础 · 阅读器</div>
+    <select id="lecture-select" title="选择课件"></select>
+    <button id="btn-update" title="git pull + 重新渲染课件">更新</button>
+    <span id="update-status" class="status"></span>
+    <div class="spacer"></div>
+    <button id="btn-settings" title="设置 API">⚙ 设置</button>
+  </header>
+
+  <main class="layout">
+    <section class="deck">
+      <iframe id="viewer" src="about:blank" title="课件"></iframe>
+      <div id="deck-empty" class="empty">正在加载课件…（若第一次使用，先点右上角「更新」渲染）</div>
+    </section>
+
+    <aside class="chat">
+      <div class="chat-head">
+        <span id="current-page" class="current-page">未在阅读某一页</span>
+      </div>
+      <div id="messages" class="messages"></div>
+      <form id="chat-form" class="chat-input">
+        <textarea id="question" rows="2" placeholder="就当前这一页提问（可结合前后内容）…"></textarea>
+        <button type="submit" id="btn-send">发送</button>
+      </form>
+    </aside>
+  </main>
+
+  <dialog id="settings-modal">
+    <div class="modal">
+      <h3>设置</h3>
+      <label>API Base URL（OpenAI 兼容）
+        <input id="cfg-base" placeholder="https://api.deepseek.com" />
+      </label>
+      <label>模型
+        <input id="cfg-model" placeholder="deepseek-chat" />
+      </label>
+      <label>API Key
+        <input id="cfg-key" type="password" placeholder="sk-..." />
+      </label>
+      <label class="row">
+        <input id="cfg-autoupdate" type="checkbox" /> 启动时自动更新
+      </label>
+      <div class="hint">
+        兼容 DeepSeek / OpenAI / Moonshot / 智谱 / Ollama 等，只要填对 base 与 model 即可。
+        key 保存在 exe 同目录的 config.json 里，不会上传到别处。
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="btn-cancel">取消</button>
+        <button type="button" id="btn-save" class="primary">保存</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
