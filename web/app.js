@@ -26,7 +26,19 @@ function escapeHtml(s) {
 
 // 极简 markdown（离线，不引 CDN）
 function md(src) {
-  let s = escapeHtml(src);
+  // 先把 LaTeX 公式换成占位符，避免被转义/markdown 规则破坏，最后用 KaTeX 还原。
+  const math = [];
+  let s = src;
+  s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, tex) => {
+    math.push({ display: true, tex });
+    return `\u0000K${math.length - 1}\u0000`;
+  });
+  s = s.replace(/\$([^$\n]+)\$/g, (_, tex) => {
+    math.push({ display: false, tex });
+    return `\u0000K${math.length - 1}\u0000`;
+  });
+
+  s = escapeHtml(s);
   // fenced code blocks
   s = s.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code.replace(/^\n/, "")}</code></pre>`);
   // inline code
@@ -49,6 +61,16 @@ function md(src) {
   s = s.replace(/\n{2,}/g, "</p><p>");
   s = "<p>" + s + "</p>";
   s = s.replace(/<p><(ul|pre|h[1-4])/g, "<$1").replace(/<\/(ul|pre|h[1-4])><\/p>/g, "</$1>");
+
+  // 还原公式
+  s = s.replace(/\u0000K(\d+)\u0000/g, (_, i) => {
+    const m = math[+i];
+    try {
+      return katex.renderToString(m.tex, { displayMode: m.display, throwOnError: false });
+    } catch (e) {
+      return escapeHtml(m.display ? `$$${m.tex}$$` : `$${m.tex}$`);
+    }
+  });
   return s;
 }
 

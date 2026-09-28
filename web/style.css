@@ -93,6 +93,8 @@ button:disabled { opacity: .5; cursor: default; }
 .msg.assistant pre code { background: none; color: inherit; padding: 0; }
 .msg.assistant ul, .msg.assistant ol { margin: 4px 0 8px; padding-left: 20px; }
 .msg.assistant h1,.msg.assistant h2,.msg.assistant h3 { margin: 10px 0 6px; }
+.msg.assistant .katex { font-size: 1.05em; }
+.msg.assistant .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
 
 .chat-input {
   display: flex;
