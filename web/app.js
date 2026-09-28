@@ -6,6 +6,7 @@ const select = $("#lecture-select");
 const statusEl = $("#update-status");
 const currentPageEl = $("#current-page");
 const messagesEl = $("#messages");
+const emptyEl = $("#deck-empty");
 
 let current = null; // {lecture, page, title, number}
 
@@ -75,8 +76,8 @@ async function loadCourse() {
     select.innerHTML = '<option value="">（暂无课件）</option>';
     // 首次启动自动更新可能还在跑：盯一下，跑完自动重载
     const st = await api("/api/update/status");
-    if (st.running) { watchUpdate(); }
-    else { statusEl.textContent = "还没有课件，点右上角「更新」渲染"; }
+    if (st.running) { emptyEl.textContent = "正在渲染课件，请稍候…"; watchUpdate(); }
+    else { emptyEl.textContent = "还没有课件，点右上角「更新」渲染"; }
     return;
   }
   for (const lec of data.lectures) {
@@ -89,7 +90,8 @@ async function loadCourse() {
 }
 
 function openLecture(id) {
-  if (!id) { viewer.src = "about:blank"; current = null; return; }
+  if (!id) { viewer.src = "about:blank"; current = null; emptyEl.style.display = "flex"; return; }
+  emptyEl.style.display = "none";
   viewer.src = "/lectures/" + id + "/index.html";
   current = current && current.lecture === id ? current : null;
 }

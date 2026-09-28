@@ -2,6 +2,10 @@
 import os
 import subprocess
 
+# 窗口化 exe 下，git / python / marp 这些控制台子进程默认会各自弹一个 cmd 窗口；
+# CREATE_NO_WINDOW 让它们不带控制台窗口运行（stdout/stderr 仍走管道被我们捕获）。
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def _marp_cmd(ppt: str):
     return os.path.join(ppt, "node_modules", ".bin", "marp.cmd")
@@ -27,7 +31,7 @@ def update(config: dict, build_root: str, stubs_dir: str, log=lambda line: None)
     # 1. 拉取老师最新课件（失败不致命，用本地版本继续）
     log("git pull --ff-only ...")
     r = subprocess.run(["git", "-C", repo, "pull", "--ff-only"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
     if r.returncode == 0:
         log("git pull 成功")
     else:
@@ -54,6 +58,7 @@ def update(config: dict, build_root: str, stubs_dir: str, log=lambda line: None)
         r = subprocess.run(
             [python, "-m", "lecturekit.cli", "render", src, "--out", out],
             cwd=ppt, env=env, capture_output=True, text=True,
+            creationflags=CREATE_NO_WINDOW,
         )
         if r.returncode == 0:
             ok += 1
