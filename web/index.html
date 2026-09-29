@@ -3,42 +3,77 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>计算机系统基础 · 阅读器</title>
+  <meta name="color-scheme" content="light dark" />
+  <title>SJTU-ICS</title>
+  <script>
+    // 首绘前定好主题，深色下才不会先闪一块白。
+    // ?theme= 是 app.py 解析好的结果（「跟随系统」在那边就落地了）；直接开浏览器时没有它，
+    // 退回 matchMedia。之后以 /api/config 里的 theme 为准，见 app.js 的 applyTheme()。
+    (function () {
+      try {
+        var q = (location.search.match(/[?&]theme=(light|dark)\b/) || [])[1];
+        var dark = window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = q || (dark ? "dark" : "light");
+      } catch (e) { /* 出错就用样式表里的默认浅色 */ }
+    })();
+  </script>
   <link rel="stylesheet" href="style.css" />
   <link rel="stylesheet" href="katex/katex.min.css" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">计算机系统基础 · 阅读器</div>
-    <select id="lecture-select" title="选择课件"></select>
-    <button id="btn-update" title="git pull + 重新渲染课件">更新</button>
+    <div class="brand">SJTU-ICS</div>
+    <select id="lecture-select"></select>
+    <button id="btn-update">更新</button>
+    <button id="btn-export">导出 PDF</button>
     <span id="update-status" class="status"></span>
     <div class="spacer"></div>
-    <button id="btn-settings" title="设置 API">⚙ 设置</button>
+    <button id="btn-settings">⚙ 设置</button>
   </header>
 
   <main class="layout">
     <section class="deck">
-      <iframe id="viewer" src="about:blank" title="课件"></iframe>
-      <div id="deck-empty" class="empty">正在加载课件…（若第一次使用，先点右上角「更新」渲染）</div>
+      <!-- 用 aria-label 而不是 title：iframe 上的 title 在部分浏览器里会飘出黑框提示 -->
+      <iframe id="viewer" src="about:blank" aria-label="课件"></iframe>
+      <div id="deck-empty" class="empty">正在加载课件…（首次使用请先点「更新」）</div>
     </section>
+
+    <div id="chat-resizer" class="chat-resizer" role="separator" aria-orientation="vertical"
+         aria-label="调整侧栏宽度"></div>
 
     <aside class="chat">
       <div class="chat-head">
-        <span id="current-page" class="current-page">未在阅读某一页</span>
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab active" data-mode="ask" role="tab">问答</button>
+          <button type="button" class="tab" data-mode="search" role="tab">检索</button>
+        </div>
       </div>
       <div id="messages" class="messages"></div>
+      <div id="results" class="results" hidden></div>
       <form id="chat-form" class="chat-input">
-        <textarea id="question" rows="2" placeholder="就当前这一页提问（可结合前后内容）…"></textarea>
-        <button type="submit" id="btn-send">发送</button>
+        <select id="search-scope" class="scope" hidden>
+          <option value="lecture">本讲</option>
+          <option value="all">全部</option>
+        </select>
+        <div class="input-row">
+          <textarea id="question" rows="2" placeholder="问问AI助手"></textarea>
+          <button type="submit" id="btn-send" class="icon" aria-label="发送">↑</button>
+        </div>
       </form>
     </aside>
   </main>
 
+  <!-- 课件里划词后弹出的菜单 -->
+  <div id="ctx-menu" class="ctx-menu" hidden>
+    <button type="button" data-act="quote">引用</button>
+    <button type="button" data-act="explain">解释</button>
+    <button type="button" data-act="copy">复制</button>
+  </div>
+
   <dialog id="settings-modal">
     <div class="modal">
       <h3>设置</h3>
-      <label>API Base URL（OpenAI 兼容）
+      <label>Base URL
         <input id="cfg-base" placeholder="https://api.deepseek.com" />
       </label>
       <label>模型
@@ -47,16 +82,48 @@
       <label>API Key
         <input id="cfg-key" type="password" placeholder="sk-..." />
       </label>
-      <label class="row">
-        <input id="cfg-autoupdate" type="checkbox" /> 启动时自动更新
-      </label>
-      <div class="hint">
-        兼容 DeepSeek / OpenAI / Moonshot / 智谱 / Ollama 等，只要填对 base 与 model 即可。
-        key 保存在 exe 同目录的 config.json 里，不会上传到别处。
+      <div class="row">
+        <label class="inline">
+          <input id="cfg-autoupdate" type="checkbox" /> 启动时自动更新
+        </label>
+        <label class="inline">主题
+          <select id="cfg-theme">
+            <option value="system">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
       </div>
+      <div class="hint">
+        填域名即可，程序自动补 <code>/v1/chat/completions</code>。key 只存在本地 config.json。
+      </div>
+      <div id="test-result" class="test-result" hidden></div>
+      <div id="model-picker" class="model-picker" hidden></div>
       <div class="modal-actions">
+        <button type="button" id="btn-list-models">列出模型</button>
+        <button type="button" id="btn-test-api">测试连接</button>
+        <button type="button" id="btn-wizard-open">环境检测</button>
+        <div class="spacer"></div>
         <button type="button" id="btn-cancel">取消</button>
         <button type="button" id="btn-save" class="primary">保存</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="wizard-modal">
+    <div class="modal">
+      <h3>环境检测</h3>
+      <p class="hint">
+        浏览与提问不需要下列任何一项；只有「更新课件」和「导出 PDF」需要。
+        每一项都得你亲手点「安装」才会执行。
+      </p>
+      <div id="wizard-list" class="wizard-list"></div>
+      <div id="wizard-log" class="wizard-log" hidden></div>
+      <div class="modal-actions">
+        <button type="button" id="btn-wizard-redetect">重新检测</button>
+        <button type="button" id="btn-wizard-dismiss">不再提示缺失项</button>
+        <div class="spacer"></div>
+        <button type="button" id="btn-wizard-close" class="primary">关闭</button>
       </div>
     </div>
   </dialog>
