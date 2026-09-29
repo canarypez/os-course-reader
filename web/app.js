@@ -273,6 +273,8 @@ function stoppedMark() {
 // ------------------------------------------------------------------ 课件
 async function loadCourse() {
   const data = await api("/api/course");
+  // 重建 <select> 之后 value 会掉回第一项，先记下此刻看的是哪一讲
+  const prev = select.value;
   lectureVid = {};
   select.innerHTML = "";
   if (!data.lectures || data.lectures.length === 0) {
@@ -290,10 +292,18 @@ async function loadCourse() {
     select.appendChild(o);
     lectureVid[lec.id] = lec.vid || lec.id;
   }
+  // 这一讲还在，就接着看这一讲。loadCourse 的调用方是「更新跑完了」和启动，
+  // 都不是「换一讲」的意思；照 select.value（此刻已经是第一项）打开，
+  // 会把正在读的人弹回第一讲第一页。
+  if (lectureVid[prev]) select.value = prev;
   openLecture(select.value);
 }
 
+let loadedLecture = null;        // 课件区里现在装着哪一讲
+
 function openLecture(id) {
+  const changed = id !== loadedLecture;
+  loadedLecture = id;
   if (!id) {
     viewer.src = "about:blank";
     current = null;
@@ -304,8 +314,9 @@ function openLecture(id) {
   emptyEl.style.display = "none";
   viewer.src = "/lectures/" + id + "/index.html";
   current = current && current.lecture === id ? current : null;
-  // 对话按讲分，换了讲就不能把上一讲的聊天记录留在眼前
-  resetChat();
+  // 对话按讲分，换了讲就不能把上一讲的聊天记录留在眼前。
+  // 但同一讲重载（更新跑完、保存设置）不算换讲 —— 那会把正在进行的对话也抹掉。
+  if (changed) resetChat();
 }
 
 // 读进两层 iframe：外壳(index.html) → .slide-frame(slides.html)
@@ -1108,7 +1119,8 @@ async function saveSettings() {
   });
   applyTheme();
   $("#settings-modal").close();
-  loadCourse();
+  // 这里不重读课程列表：设置里能改的五项都不影响课程，而 loadCourse() 会重建
+  // <select> 并把课件区导航回第一讲，读着课件进来改个设置就被弹回去。
 }
 
 // ------------------------------------------------------------------ 绑定
