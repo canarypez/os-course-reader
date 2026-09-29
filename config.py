@@ -40,7 +40,46 @@ DEFAULTS = {
     "max_retrieve": 4,
     # 自定义 system prompt（留空用默认）
     "system_prompt": "",
+    # 用户在向导里勾了「不再提示」的检测项（key 列表）
+    "wizard_dismissed": [],
+    # 聊天侧栏宽度（px，拖拽后记住）
+    "chat_width": 440,
+    # 主题：system = 跟随 Windows，light / dark = 强制
+    "theme": "system",
 }
+
+
+#: 界面上 api_key 的回显掩码（见 server.py 的 /api/config）。
+#: 用户打开设置、没重填 key 就点保存的话，这串圆点会被当成真 key 存下来 —— 之后每次
+#: 请求都发 `Authorization: Bearer ••••1234`，而 httpx 编不了非 ASCII 的请求头，报回来
+#: 的是一句 `'ascii' codec can't encode characters in position 7-10` 的天书。
+#: 读、写两侧都得挡住它。
+MASK = "••••"
+
+
+def is_masked(value) -> bool:
+    """这个值是界面回显用的掩码，不是真 key。"""
+    return str(value or "").strip().startswith(MASK)
+
+
+def system_theme() -> str:
+    """Windows「应用」模式的深浅色；读不到就按浅色算。
+
+    只在开窗那一刻用一次（窗口背景色 + 首绘提示）—— 页面自己还会 matchMedia 一次，
+    之后以 config.json 的 theme 为准。
+    """
+    if os.name != "nt":
+        return "light"
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as k:
+            light, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+        return "light" if int(light) else "dark"
+    except Exception:
+        return "light"
 
 
 def config_path() -> str:
@@ -61,12 +100,20 @@ def load_config() -> dict:
                 cfg.update(json.load(f))
         except Exception:
             pass
+    # 自愈：早先的版本会把界面回显的掩码当 key 存下来，那种配置等于坏掉了，
+    # 当作没填，让用户在设置里重填一次
+    if is_masked(cfg.get("api_key")):
+        cfg["api_key"] = ""
     return cfg
 
 
 def save_config(updates: dict) -> dict:
     cfg = load_config()
-    cfg.update({k: v for k, v in updates.items() if k in DEFAULTS})
+    clean = {k: v for k, v in updates.items() if k in DEFAULTS}
+    # 掩码只是给界面看的，不是真 key；原样存下去会把用户真正的 key 覆盖掉
+    if is_masked(clean.get("api_key")):
+        clean.pop("api_key")
+    cfg.update(clean)
     p = config_path()
     with open(p, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)

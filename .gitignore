@@ -14,3 +14,6 @@ __pycache__/
 # PyInstaller
 dist/
 *.spec
+
+# 浏览器直开时的 PDF 导出落点
+exports/

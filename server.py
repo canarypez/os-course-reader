@@ -1,15 +1,25 @@
 """本地 HTTP 服务：静态资源（前端壳 + 课件 bundle）+ JSON API。
 
 只绑定 127.0.0.1，供本机窗口使用。API：
-  GET  /api/course        课程列表 + 大纲 + 是否有 key
-  POST /api/chat          {lecture, page, question} -> {answer}
-  GET  /api/config        当前配置（key 打码）
-  POST /api/config        保存配置
-  POST /api/update        触发后台更新
-  GET  /api/update/status 更新进度
+  GET  /api/course           课程列表 + 大纲 + 是否有 key
+  POST /api/chat             {lecture, page, question} -> {answer}
+  POST /api/test_api         {api_base, model, api_key} -> 连接自检结果
+  POST /api/models           {api_base, api_key} -> 该站可用的模型 id 列表
+  POST /api/search           {query, lecture|null} -> {results}
+  POST /api/export_pdf       {lecture, dest} -> 启动后台导出
+  GET  /api/export/status    导出进度
+  POST /api/reveal           {path} -> 在资源管理器里定位该文件
+  GET  /api/wizard           环境检测结果
+  POST /api/wizard/install   {key, dir?} -> 启动后台安装
+  GET  /api/wizard/status    安装进度
+  GET  /api/config           当前配置（key 打码）
+  POST /api/config           保存配置
+  POST /api/update           触发后台更新
+  GET  /api/update/status    更新进度
 """
 import json
 import os
+import subprocess
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,56 +28,158 @@ from urllib.parse import urlparse
 import agent
 import config as cfgmod
 import sync
+import wizard
+
+
+class Job:
+    """一个后台任务的状态：running + 逐行日志 + 结果 / 错误。
+
+    更新、导出 PDF、装依赖三件事的形状完全一样（慢、要报进度、要能轮询），
+    共用这一个类，别再抄三份。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.running = False
+        self.lines = []
+        self.error = None
+        self.result = None
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "running": self.running,
+                "lines": list(self.lines),
+                "error": self.error,
+                "result": self.result,
+            }
+
+    def _log(self, line):
+        with self._lock:
+            self.lines.append(str(line))
+
+    def start(self, work, name="job"):
+        """work(log) 在后台线程里跑；已在跑则返回 False（不排队、不重入）。"""
+        with self._lock:
+            if self.running:
+                return False
+            self.running = True
+            self.lines = []
+            self.error = None
+            self.result = None
+
+        def run():
+            try:
+                result = work(self._log)
+                with self._lock:
+                    self.result = result
+            except Exception as e:
+                traceback.print_exc()
+                with self._lock:
+                    self.error = str(e)
+            finally:
+                with self._lock:
+                    self.running = False
+
+        threading.Thread(target=run, daemon=True, name=name).start()
+        return True
 
 
 class App:
     def __init__(self, config):
         self.config = config
         self.store = agent.CourseStore(cfgmod.build_root())
-        self._lock = threading.Lock()
-        self.update_state = {"running": False, "lines": [], "error": None}
-        self.update_thread = None
+        self.update_job = Job()
+        self.export_job = Job()
+        self.install_job = Job()
 
-    # ---- 更新（后台线程）----
+    # ---- 更新 ----
     def start_update(self):
-        with self._lock:
-            if self.update_state["running"]:
-                return False
-            self.update_state = {"running": True, "lines": [], "error": None}
+        def work(log):
+            sync.update(self.config, cfgmod.build_root(), cfgmod.resource("stubs"), log)
+            self.store.reload()   # 渲染完重读 corpus
 
-        def run():
-            lines = []
-            def log(line):
-                lines.append(line)
-                with self._lock:
-                    self.update_state["lines"] = list(lines)
-            try:
-                sync.update(
-                    self.config, cfgmod.build_root(), cfgmod.resource("stubs"), log
-                )
-            except Exception as e:
-                log("更新出错：" + str(e))
-                with self._lock:
-                    self.update_state["error"] = str(e)
-            finally:
-                self.store.reload()  # 渲染完重读 corpus
-                with self._lock:
-                    self.update_state["running"] = False
+        return self.update_job.start(work, name="update")
 
-        self.update_thread = threading.Thread(target=run, daemon=True)
-        self.update_thread.start()
-        return True
+    # ---- 导出 PDF ----
+    def start_export(self, lid, dest):
+        bundle = os.path.join(cfgmod.build_root(), lid)
+        if not os.path.isdir(bundle):
+            return False
+        if not dest:
+            # 浏览器直开（没有 pywebview 的原生「另存为」）时的落点
+            dest = os.path.join(cfgmod.DATA_DIR, "exports", lid + ".pdf")
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        repo = self.config.get("repo") or ""
+        ppt = os.path.join(repo, "ICS-PPT")
+        python = (self.config.get("python") or "python").strip()
+        script = cfgmod.resource("pdf_export.py")
 
-    def update_status(self):
-        with self._lock:
-            return dict(self.update_state)
+        def work(log):
+            env = sync.render_env(ppt, cfgmod.resource("stubs"))
+            env["PYTHONIOENCODING"] = "utf-8"   # 目标路径可能含中文
+            log("正在生成 PDF（marp 重排 + 合并目录，需要几十秒）…")
+            r = subprocess.run(
+                [python, script, bundle, dest],
+                cwd=ppt, env=env, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", creationflags=sync.CREATE_NO_WINDOW,
+            )
+            tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-6:]
+            for line in tail:
+                log(line)
+            if r.returncode != 0:
+                raise RuntimeError(self._export_error(r.returncode, tail))
+            if not os.path.isfile(dest):
+                raise RuntimeError("导出结束但没找到文件：" + dest)
+            log("导出完成")
+            return {"path": dest}
 
+        return self.export_job.start(work, name="export")
+
+    @staticmethod
+    def _export_error(code, tail):
+        text = " ".join(tail)
+        if "Chrome" in text or "chrome" in text or code == 1 and "Browser" in text:
+            return "找不到 Chrome，无法排版目录页。可在「环境检测」里安装 Chrome，或用 Edge 兜底。"
+        if "marp" in text.lower() or "npx" in text:
+            return "marp 不可用（课件排版工具）。请在「环境检测」里安装 marp-cli。"
+        if "lecturekit" in text or "ModuleNotFoundError" in text:
+            return "渲染环境不完整（lecturekit 未装好）。请打开「环境检测」逐项补全。"
+        return f"导出失败（退出码 {code}）：{text[-200:]}"
+
+    # ---- 环境检测 / 安装 ----
+    def wizard_payload(self):
+        items = wizard.detect(self.config)
+        s = wizard.summary(items)
+        dismissed = set(self.config.get("wizard_dismissed") or [])
+        return {
+            "items": items,
+            "ok": s["ok"],
+            "missing": s["missing"],
+            # 启动时自动弹窗的条件：确实缺东西，且没有一项是用户说过不再提示的
+            "should_prompt": bool(s["missing"]) and not all(m in dismissed for m in s["missing"]),
+        }
+
+    def start_install(self, key, target_dir=None):
+        def work(log):
+            res = wizard.install(key, self.config, log, target_dir=target_dir)
+            if res.get("config"):
+                # 装完把解析到的绝对路径（python / repo）写回配置，否则下次还是找不到
+                self.config = cfgmod.save_config(res["config"])
+            if not res.get("ok"):
+                raise RuntimeError("安装未成功，详见上方输出。")
+            return res
+
+        return self.install_job.start(work, name="install")
+
+    # ---- 课程列表 ----
     def course_payload(self):
         lectures = []
         for lid in self.store.lecture_ids():
             lec = self.store.lectures[lid]
             lectures.append({
                 "id": lid,
+                "vid": lec["vid"],
                 "title": lec["title"],
                 "outline": "\n".join(self.store._outline_text(lec["tree"])),
             })
@@ -103,6 +215,24 @@ def make_server(app: App, port: int):
                 return {}
             return json.loads(raw.decode("utf-8"))
 
+        def _probe_config(self):
+            """用界面上「当前填着」的值去探测，不必先保存。
+
+            测试连接 / 列模型都吃这一套，所以放一处。
+            """
+            b = self._read_json()
+            probe = dict(app_ref.config)
+            # base / model 原样照收：界面清空了就是清空了，不能偷偷回退到存着的值，
+            # 否则用户会看到「地址」和「实际打的地址」对不上
+            for k in ("api_base", "model"):
+                if k in b:
+                    probe[k] = str(b[k]).strip()
+            # key 不同：界面上回显的是打码后的（••••1234），没重填就用存着的那把
+            key = str(b.get("api_key") or "").strip()
+            if key and not cfgmod.is_masked(key):
+                probe["api_key"] = key
+            return probe
+
         def _file(self, path):
             # 只允许 web/ 与 build/ 之下的文件，防目录穿越
             if path == "/":
@@ -134,6 +264,8 @@ def make_server(app: App, port: int):
                 ctype = "image/svg+xml"
             elif full.endswith(".woff2"):
                 ctype = "font/woff2"
+            elif full.endswith(".png"):
+                ctype = "image/png"
             with open(full, "rb") as f:
                 data = f.read()
             self.send_response(200)
@@ -149,10 +281,16 @@ def make_server(app: App, port: int):
                 return self._json(app_ref.course_payload())
             if p == "/api/config":
                 c = dict(app_ref.config)
-                c["api_key"] = "••••" + c["api_key"][-4:] if c.get("api_key") else ""
+                c["api_key"] = cfgmod.MASK + c["api_key"][-4:] if c.get("api_key") else ""
                 return self._json(c)
             if p == "/api/update/status":
-                return self._json(app_ref.update_status())
+                return self._json(app_ref.update_job.snapshot())
+            if p == "/api/export/status":
+                return self._json(app_ref.export_job.snapshot())
+            if p == "/api/wizard":
+                return self._json(app_ref.wizard_payload())
+            if p == "/api/wizard/status":
+                return self._json(app_ref.install_job.snapshot())
             return self._file(p)
 
         def do_POST(self):
@@ -167,9 +305,53 @@ def make_server(app: App, port: int):
                         return self._json({"error": "问题不能为空"}, 400)
                     ans = agent.ask(app_ref.config, app_ref.store, lid, pid, q)
                     return self._json({"answer": ans})
+                if p in ("/api/test_api", "/api/models"):
+                    probe = self._probe_config()
+                    if p == "/api/test_api":
+                        return self._json(agent.test_connection(probe))
+                    return self._json(agent.list_models(probe))
+                if p == "/api/search":
+                    b = self._read_json()
+                    q = (b.get("query") or "").strip()
+                    if not q:
+                        return self._json({"results": []})
+                    lid = b.get("lecture") or None
+                    scope = b.get("scope") or "lecture"
+                    if scope == "all":
+                        lid = None
+                    return self._json({"results": app_ref.store.search(q, lid=lid, k=30)})
+                if p == "/api/export_pdf":
+                    b = self._read_json()
+                    lid = b.get("lecture")
+                    dest = (b.get("dest") or "").strip()
+                    if not lid:
+                        return self._json({"error": "缺少 lecture"}, 400)
+                    if dest and not dest.lower().endswith(".pdf"):
+                        dest += ".pdf"
+                    if not os.path.isdir(os.path.join(cfgmod.build_root(), lid)):
+                        return self._json({"error": "这一讲还没渲染出课件，先点右上角「更新」"}, 400)
+                    if not app_ref.start_export(lid, dest):     # dest 为空则由后端兜底
+                        return self._json({"error": "已有导出在进行"}, 400)
+                    return self._json({"started": True})
+                if p == "/api/reveal":
+                    b = self._read_json()
+                    path = (b.get("path") or "").strip()
+                    if path and os.path.exists(path):
+                        subprocess.Popen(["explorer", "/select,", os.path.normpath(path)],
+                                         creationflags=sync.CREATE_NO_WINDOW)
+                    return self._json({"ok": True})
+                if p == "/api/wizard/install":
+                    b = self._read_json()
+                    key = b.get("key")
+                    if not key:
+                        return self._json({"error": "缺少 key"}, 400)
+                    started = app_ref.start_install(key, b.get("dir"))
+                    return self._json({"started": started})
                 if p == "/api/config":
                     b = self._read_json()
                     allowed = {k: v for k, v in b.items() if k in cfgmod.DEFAULTS}
+                    # api_key 若是界面上那串掩码，save_config 会丢掉它 —— 保存掩码会把
+                    # 真 key 覆盖成「••••1234」，之后每个请求都发不出去
                     app_ref.config = cfgmod.save_config(allowed)
                     return self._json({"ok": True, "config": app_ref.course_payload()})
                 if p == "/api/update":

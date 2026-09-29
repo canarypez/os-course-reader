@@ -7,8 +7,24 @@ import subprocess
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def _marp_cmd(ppt: str):
-    return os.path.join(ppt, "node_modules", ".bin", "marp.cmd")
+def marp_js(ppt: str) -> str:
+    """vendored marp-cli 的入口 js。lecturekit 自己会优先用它，这里只用来判断有没有。"""
+    return os.path.join(ppt, "node_modules", "@marp-team", "marp-cli", "marp-cli.js")
+
+
+def render_env(ppt: str, stubs_dir: str) -> dict:
+    """渲染子进程的环境（更新与导出 PDF 共用）。
+
+    lecturekit/demo.py 顶层 import fcntl/pty/termios（Unix 专属），用占位模块让 import 过。
+
+    这里不设 LECTUREKIT_MARP：lecturekit 的 marp_command() 会自己解析，优先用 vendored 的
+    node_modules/@marp-team/marp-cli/marp-cli.js（以 `node <js>` 方式启动）。而那个覆盖会指向
+    node_modules/.bin/marp.cmd —— Windows 上 .bin 里是 shell 脚本，CreateProcess 起不来
+    （见 lecturekit/renderers/viewer/marp.py 的 marp_command 注释）。
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = stubs_dir + os.pathsep + env.get("PYTHONPATH", "")
+    return env
 
 
 def update(config: dict, build_root: str, stubs_dir: str, log=lambda line: None):
@@ -18,12 +34,8 @@ def update(config: dict, build_root: str, stubs_dir: str, log=lambda line: None)
     python = config.get("python") or "python"
     lectures_dir = os.path.join(ppt, "lectures")
 
-    env = dict(os.environ)
-    # lecturekit/demo.py 顶层 import fcntl/pty/termios（Unix 专属），用占位模块让 import 过。
-    env["PYTHONPATH"] = stubs_dir + os.pathsep + env.get("PYTHONPATH", "")
-    marp = _marp_cmd(ppt)
-    if os.path.exists(marp):
-        env["LECTUREKIT_MARP"] = marp
+    env = render_env(ppt, stubs_dir)
+    if os.path.exists(marp_js(ppt)):
         log("使用 vendored marp-cli")
     else:
         log("未找到 vendored marp，将回退 npx（可能需联网）")
