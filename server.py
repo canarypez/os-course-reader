@@ -16,6 +16,11 @@
   POST /api/config           保存配置
   POST /api/update           触发后台更新
   GET  /api/update/status    更新进度
+  POST /api/chat/stream      {lecture, page, question, cid, history} -> SSE 流式回答
+  POST /api/history/list     {lecture} -> 本讲的对话列表
+  POST /api/history/new      {lecture, cid?} -> 新对话 id
+  POST /api/history/get      {lecture, id} -> 整条对话
+  POST /api/history/delete   {lecture, id} -> 删掉一条对话
 """
 import json
 import os
@@ -27,6 +32,7 @@ from urllib.parse import urlparse
 
 import agent
 import config as cfgmod
+import history as hist
 import sync
 import wizard
 
@@ -208,6 +214,99 @@ def make_server(app: App, port: int):
             self.end_headers()
             self.wfile.write(body)
 
+        def _sse(self, obj):
+            """发一帧 SSE。写失败（客户端断开）由调用方接住。
+
+            wbufsize 是 0，wfile.write 直接就是 sendall，写入路径上没有缓冲；
+            flush 留着当保险。
+            """
+            self.wfile.write(
+                ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+
+        def _chat_stream(self):
+            """流式问答。
+
+            整个分支待在 do_POST 的 try **之外**：一旦发过 200 和一堆帧，再让那个
+            `except -> _json(500)` 去 send_response，就是二次发状态行，报出来的东西
+            比原始错误还难看。所以这里自己兜住一切。
+            """
+            try:
+                b = self._read_json()
+            except Exception:
+                return self._json({"error": "请求体不是合法 JSON"}, 400)
+
+            lid = b.get("lecture")
+            pid = b.get("page")
+            q = (b.get("question") or "").strip()
+            cid = str(b.get("cid") or "").strip()
+            history = b.get("history") or []
+            if not q:
+                return self._json({"error": "问题不能为空"}, 400)
+
+            # 先建生成器并拉第一帧，把「没填 key」「地址不对」「401」这些在**发响应头
+            # 之前**逼出来 —— 那会儿还能规规矩矩回一个 JSON 错误。
+            gen = agent.stream_chat(app_ref.config, app_ref.store, lid, pid, q, history)
+            try:
+                first = next(gen)
+            except StopIteration:
+                first = None
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+            # 到这儿请求已经通了，发头。之后不写 Content-Length —— 靠连接关闭定界，
+            # 这正是 SSE 要的。实测 WebView2 会逐块交给 fetch 的 ReadableStream。
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            tracked = bool(lid) and bool(cid)      # 没有当前讲就没处显示，不记
+            if tracked:
+                hist.ensure_conversation(lid, cid, q, page=pid)
+
+            parts = []
+            aborted = False
+            try:
+                self._sse({"type": "meta", "cid": cid})
+                if first:
+                    parts.append(first)
+                    self._sse({"type": "delta", "content": first})
+
+                for text in gen:
+                    parts.append(text)
+                    self._sse({"type": "delta", "content": text})
+            except OSError:
+                aborted = True                 # 客户端没了：关窗口 / 切讲 / 点了停止
+            except Exception as e:
+                aborted = True
+                try:
+                    self._sse({"type": "error", "error": str(e)})
+                except OSError:
+                    pass
+
+            answer = "".join(parts)
+            if tracked and answer:
+                hist.finish_turn(lid, cid, answer, stopped=aborted)
+
+            if aborted:
+                return                         # 连接已经没了，再写只是继续抛
+
+            self._sse({"type": "done"})
+
+            # 标题帧在 done **之后**，前端必须一直读到 EOF 才收得到。生成失败就不发，
+            # 列表里那条用问题前 10 字的兜底标题照样能用。
+            title = agent.generate_title(app_ref.config, q, answer)
+            if title and tracked:
+                hist.set_title(lid, cid, title)
+            if title:
+                try:
+                    self._sse({"type": "title", "title": title})
+                except OSError:
+                    pass
+
+
         def _read_json(self):
             n = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(n) if n else b""
@@ -295,6 +394,9 @@ def make_server(app: App, port: int):
 
         def do_POST(self):
             p = urlparse(self.path).path
+            # 流式必须先走：它自己发响应头，不能落进下面那个 except -> _json(500) 里
+            if p == "/api/chat/stream":
+                return self._chat_stream()
             try:
                 if p == "/api/chat":
                     b = self._read_json()
@@ -303,8 +405,23 @@ def make_server(app: App, port: int):
                     q = (b.get("question") or "").strip()
                     if not q:
                         return self._json({"error": "问题不能为空"}, 400)
-                    ans = agent.ask(app_ref.config, app_ref.store, lid, pid, q)
+                    ans = agent.ask(app_ref.config, app_ref.store, lid, pid, q,
+                                    b.get("history"))
                     return self._json({"answer": ans})
+                if p.startswith("/api/history/"):
+                    b = self._read_json()
+                    lid = b.get("lecture")
+                    if not lid:
+                        return self._json({"error": "缺少 lecture"}, 400)
+                    cid = b.get("id") or b.get("cid")
+                    if p == "/api/history/list":
+                        return self._json({"conversations": hist.list_conversations(lid)})
+                    if p == "/api/history/new":
+                        return self._json({"id": hist.new(lid, cid)})
+                    if p == "/api/history/get":
+                        return self._json({"conversation": hist.get(lid, cid)})
+                    if p == "/api/history/delete":
+                        return self._json({"ok": hist.delete(lid, cid)})
                 if p in ("/api/test_api", "/api/models"):
                     probe = self._probe_config()
                     if p == "/api/test_api":

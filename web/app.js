@@ -26,73 +26,248 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
+// 引号也要转：链接的 href 是唯一一处把模型给的文字放进**属性**的地方，
+// 不转的话 `[x](https://a.com"onmouseover="alert(1))` 能拼出一个真的属性注入。
 function escapeHtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-// 极简 markdown（离线，不引 CDN）
+// KaTeX 是整个渲染里最贵的一步（单个公式 1-5ms，一轮回答几十个公式就是上百毫秒）。
+// 流式时每来一小段就要重跑一次 md()，不记下来的话同一批公式会被反复渲染几十遍。
+// 键里带上 displayMode：同一个 tex 行内和块级的渲染结果不一样。
+const katexCache = new Map();
+const KATEX_CACHE_MAX = 500;
+
+function renderTex(tex, display) {
+  const key = (display ? "D\u0000" : "I\u0000") + tex;
+  const hit = katexCache.get(key);
+  if (hit !== undefined) return hit;
+  let html;
+  try {
+    html = katex.renderToString(tex, { displayMode: display, throwOnError: false });
+  } catch (e) {
+    html = escapeHtml(display ? `$$${tex}$$` : `$${tex}$`);
+  }
+  if (katexCache.size >= KATEX_CACHE_MAX) katexCache.clear();   // 够用就行，不必做 LRU
+  katexCache.set(key, html);
+  return html;
+}
+
+// 流到一半时 `$x^2` 还没闭合，原样渲染会闪一个裸 `$`。这里给未闭合的部分补上**配对的**
+// 收尾符，让中途也渲染成公式；真闭合符到了自然收敛。
+//
+// 只作用于传给 md() 的副本，回答缓冲保持原样 —— 这个函数不修改输入。
+// 朴素地数 `$` 的奇偶会全错：得认 `\` 转义、``` 围栏、` 行内代码，代码里的 `$` 不是公式；
+// `$$` 也只能用 `$$` 收。已知残留：`$5` 这种把 `$` 当货币用的写法仍会被当成公式开头
+// （可接受 —— 系统提示已经要求公式一律写成 $...$）。
+function balanced(src) {
+  let i = 0;
+  const n = src.length;
+  let fence = false;      // 在 ``` 围栏里
+  let inline = false;     // 在 ` 行内代码里
+  let open = "";          // 当前没闭合的公式定界符："$" 或 "$$"
+  while (i < n) {
+    if (src[i] === "\\") { i += 2; continue; }        // 转义：连着下一个字符一起跳过
+    if (fence) {
+      if (src.startsWith("```", i)) { fence = false; i += 3; } else i += 1;
+      continue;
+    }
+    if (src.startsWith("```", i)) { fence = true; i += 3; continue; }
+    if (inline) {
+      if (src[i] === "`") inline = false;
+      i += 1;
+      continue;
+    }
+    if (src[i] === "`") { inline = true; i += 1; continue; }
+    if (src[i] !== "$") { i += 1; continue; }
+
+    if (src.startsWith("$$", i)) {
+      open = open === "$$" ? "" : "$$";
+      i += 2;
+      continue;
+    }
+    if (open === "$$") { i += 1; continue; }          // 块级里单个 $ 只是正文
+    if (open === "$") { open = ""; i += 1; continue; }
+    // 行内公式体里不能有换行也没有 $（md 的规则），所以往后看一个 $ 是不是在当前行内
+    const nl = src.indexOf("\n", i + 1);
+    const close = src.indexOf("$", i + 1);
+    if (close >= 0 && (nl < 0 || close < nl)) { i = close + 1; continue; }
+    open = "$";
+    i += 1;
+  }
+  if (fence) return src + "\n```";
+  if (inline) return src + "`";
+  return open ? src + open : src;
+}
+
+// 表格：GFM 的「表头行 + |---|---| 分隔行」。逐行扫比一条大正则好读，也好改。
+// 前后补空行，让它独占一个段落（否则会被后面跟进来的正文并进同一个 <p>）。
+function mdTables(s) {
+  const lines = s.split("\n");
+  const out = [];
+  const cells = (row) => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  const isRow = (t) => /^\s*\|.*\|\s*$/.test(t);
+  const isDelim = (t) => /^\s*\|[\s:|-]+\|\s*$/.test(t) && /-/.test(t);
+  for (let i = 0; i < lines.length; i++) {
+    if (isRow(lines[i]) && i + 1 < lines.length && isDelim(lines[i + 1])) {
+      let html = "<table><thead><tr>" +
+        cells(lines[i]).map((c) => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>";
+      i += 2;
+      while (i < lines.length && isRow(lines[i])) {
+        html += "<tr>" + cells(lines[i]).map((c) => "<td>" + c + "</td>").join("") + "</tr>";
+        i++;
+      }
+      i--;
+      out.push("", html + "</tbody></table>", "");
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out.join("\n");
+}
+
+// 列表：逐行扫，按缩进用栈做嵌套（写死两级不够用，大纲式回答常有三层）。
+// 子列表要开在父 <li> **闭合之前**，所以 <li> 的收尾是延迟的（pend 标记）。
+// 「列表紧接着正文」按列表结束处理，正文自己成段 —— 不实现 GFM 的 lazy continuation。
+function mdLists(s) {
+  const lines = s.split("\n");
+  const out = [];
+  const item = /^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$/;
+  const stack = [];                  // [{tag, indent, pend}]
+  // 「有没有没闭合的 <li>」必须**按层记**：从三层缩进一次退回根层时，每一层的 <li> 都要收，
+  // 用一个全局标记只收得掉最里面那层，剩下的标签就不配平了。
+  const closeLi = () => {
+    const t = stack[stack.length - 1];
+    if (t && t.pend) { out.push("</li>"); t.pend = false; }
+  };
+  const closeAll = () => {
+    const had = stack.length > 0;
+    while (stack.length) { closeLi(); out.push("</" + stack.pop().tag + ">"); }
+    if (had) out.push("");
+  };
+  const top = () => stack[stack.length - 1];
+  for (const line of lines) {
+    const m = line.match(item);
+    if (!m) { closeAll(); out.push(line); continue; }
+    const indent = m[1].replace(/\t/g, "    ").length;
+    const tag = /\d/.test(m[2]) ? "ol" : "ul";
+    while (stack.length && indent < top().indent) { closeLi(); out.push("</" + stack.pop().tag + ">"); }
+    if (!stack.length) { out.push("", "<" + tag + ">"); stack.push({ tag, indent, pend: false }); }
+    else if (indent > top().indent) { out.push("<" + tag + ">"); stack.push({ tag, indent, pend: false }); }
+    else if (tag !== top().tag) {
+      closeLi(); out.push("</" + stack.pop().tag + ">", "<" + tag + ">");
+      stack.push({ tag, indent, pend: false });
+    } else { closeLi(); }
+    out.push("<li>" + m[3]);
+    top().pend = true;
+  }
+  closeAll();
+  return out.join("\n");
+}
+
+// 极简 markdown（离线，不引 CDN）。
+//
+// 顺序是这个函数的关键：**代码块和行内代码必须先抠成占位符**。以前它们是随手在中间
+// 替换掉的，于是后面的规则能穿进代码里 —— 代码块里的空行会被段落规则插进 </p><p>
+// 把 <pre> 劈开，`$PATH` 会被当成行内公式渲染成 KaTeX。抠出来时顺手 escapeHtml
+// （占位符要到最后一刻才还原，赶不上中间那道统一转义）。
+//
+// XSS 不变量：模型给的文字全部经过 escapeHtml；例外只有 KaTeX 自己的输出、和上面
+// 已经转义过的代码。新增任何渲染分支都必须放在 escapeHtml() 之后。
 function md(src) {
-  // 先把 LaTeX 公式换成占位符，避免被转义/markdown 规则破坏，最后用 KaTeX 还原。
+  const blocks = [];                 // 块级代码
+  const inlines = [];                // 行内代码
   const math = [];
-  let s = src;
+  let s = String(src == null ? "" : src);
+
+  // 1) 块级代码。info string（```python 里的 python）剥掉不显示。
+  s = s.replace(/```([^\n]*)\n?([\s\S]*?)```/g, (_, info, code) => {
+    blocks.push("<pre><code>" + escapeHtml(code.replace(/^\n/, "")) + "</code></pre>");
+    return "\n\n\u0000F" + (blocks.length - 1) + "\u0000\n\n";
+  });
+  // 2) 行内代码
+  s = s.replace(/`([^`\n]+)`/g, (_, code) => {
+    inlines.push("<code>" + escapeHtml(code) + "</code>");
+    return "\u0000I" + (inlines.length - 1) + "\u0000";
+  });
+  // 3) 公式（$$ 在前，否则 $$ 会被当成两个空的 $...$）
   s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, tex) => {
     math.push({ display: true, tex });
-    return `\u0000K${math.length - 1}\u0000`;
+    return "\u0000K" + (math.length - 1) + "\u0000";
   });
-  s = s.replace(/\$([^$\n]+)\$/g, (_, tex) => {
+  s = s.replace(/\$([^$\n]+?)\$/g, (_, tex) => {
     math.push({ display: false, tex });
-    return `\u0000K${math.length - 1}\u0000`;
+    return "\u0000K" + (math.length - 1) + "\u0000";
   });
 
   s = escapeHtml(s);
-  // fenced code blocks
-  s = s.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code.replace(/^\n/, "")}</code></pre>`);
-  // inline code
-  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-  // headers
+
+  // 4) 块级结构
+  s = mdTables(s);
+  s = mdLists(s);
+  s = s.replace(/(?:^&gt; ?.*(?:\n|$))+/gm, (m) =>
+    "<blockquote>" + m.replace(/\n$/, "").replace(/^&gt; ?/gm, "").replace(/\n/g, "<br>") + "</blockquote>");
+  s = s.replace(/^(?:-{3,}|\*{3,}|_{3,})[ \t]*$/gm, "<hr>");
   s = s.replace(/^#### (.*)$/gm, "<h4>$1</h4>");
   s = s.replace(/^### (.*)$/gm, "<h3>$1</h3>");
   s = s.replace(/^## (.*)$/gm, "<h2>$1</h2>");
   s = s.replace(/^# (.*)$/gm, "<h1>$1</h1>");
-  // bold / italic
+
+  // 5) 行内。下划线**故意不做**斜体：ICS 课里 page_table、max_retrieve 这类标识符满篇
+  //    都是，认 _ 会把它们拆得七零八落。
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-  // 列表：整段抓连续的列表行再逐行转 <li>。分两步做，否则有序列表会被并进无序列表里。
-  s = s.replace(/(?:^[ \t]*[-*] .*(?:\n|$))+/gm, (m) =>
-    "<ul>" + m.replace(/^[ \t]*[-*] (.*)$/gm, "<li>$1</li>").replace(/\n/g, "") + "</ul>");
-  s = s.replace(/(?:^[ \t]*\d+\. .*(?:\n|$))+/gm, (m) =>
-    "<ol>" + m.replace(/^[ \t]*\d+\. (.*)$/gm, "<li>$1</li>").replace(/\n/g, "") + "</ol>");
-  // paragraphs
+  s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+  s = s.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  // URL 里不放引号和尖括号，协议只认这几种 —— 两道一起挡属性注入。
+  // 被拒的链接原样留着（此时参数已经过 escapeHtml，是纯文本，不会变成标签）。
+  s = s.replace(/\[([^\]\n]*)\]\(([^)\s"'<>]+)\)/g, (m, text, url) =>
+    /^(?:https?:|mailto:|#|\/)/i.test(url)
+      ? '<a href="' + url + '" target="_blank" rel="noreferrer noopener">' + text + "</a>"
+      : m);
+
+  // 6) 段落
+  s = s.replace(/^\n+|\n+$/g, "");              // 前后的空行会让 <p> 挂空
   s = s.replace(/\n{2,}/g, "</p><p>");
   s = "<p>" + s + "</p>";
-  s = s.replace(/<p><(ul|ol|pre|h[1-4])/g, "<$1").replace(/<\/(ul|ol|pre|h[1-4])><\/p>/g, "</$1>");
+  // 块级元素不该待在 <p> 里：浏览器会提前闭合 <p>，标签就配不平了
+  s = s.replace(/<p>(<(?:ul|ol|pre|h[1-4]|table|blockquote|hr)\b)/g, "$1");
+  s = s.replace(/<p>(\u0000F\d+\u0000)<\/p>/g, "$1");
+  s = s.replace(/(<\/(?:ul|ol|pre|h[1-4]|table|blockquote)>|<hr>|\u0000F\d+\u0000)<\/p>/g, "$1");
 
-  // 还原公式
-  s = s.replace(/\u0000K(\d+)\u0000/g, (_, i) => {
-    const m = math[+i];
-    try {
-      return katex.renderToString(m.tex, { displayMode: m.display, throwOnError: false });
-    } catch (e) {
-      return escapeHtml(m.display ? `$$${m.tex}$$` : `$${m.tex}$`);
-    }
-  });
+  // 7) 还原（放最后：之后没有任何渲染分支，转义过的内容不会再有被解释的机会）
+  s = s.replace(/\u0000K(\d+)\u0000/g, (_, i) => renderTex(math[+i].tex, math[+i].display));
+  s = s.replace(/\u0000I(\d+)\u0000/g, (_, i) => inlines[+i]);
+  s = s.replace(/\u0000F(\d+)\u0000/g, (_, i) => blocks[+i]);
   return s;
+}
+// 用户往上翻的时候别把他拽回底部 —— 只有本来就贴着底才跟着滚
+function nearBottom() {
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
 }
 
 function addMessage(role, text) {
+  const stick = nearBottom();
   const el = document.createElement("div");
   el.className = "msg " + role;
   if (role === "assistant") {
     const inner = document.createElement("div");
     inner.className = "markdown";
-    inner.innerHTML = md(text);
+    inner.innerHTML = md(text || "");
     el.appendChild(inner);
   } else {
     el.textContent = text;
   }
   messagesEl.appendChild(el);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
   return el;
+}
+
+function stoppedMark() {
+  const mark = document.createElement("span");
+  mark.className = "msg-stopped";
+  mark.textContent = "（已停止，以上是已收到的部分）";
+  return mark;
 }
 
 // ------------------------------------------------------------------ 课件
@@ -119,10 +294,18 @@ async function loadCourse() {
 }
 
 function openLecture(id) {
-  if (!id) { viewer.src = "about:blank"; current = null; emptyEl.style.display = "flex"; return; }
+  if (!id) {
+    viewer.src = "about:blank";
+    current = null;
+    emptyEl.style.display = "flex";
+    resetChat();
+    return;
+  }
   emptyEl.style.display = "none";
   viewer.src = "/lectures/" + id + "/index.html";
   current = current && current.lecture === id ? current : null;
+  // 对话按讲分，换了讲就不能把上一讲的聊天记录留在眼前
+  resetChat();
 }
 
 // 读进两层 iframe：外壳(index.html) → .slide-frame(slides.html)
@@ -254,32 +437,288 @@ function renderResults(list, q) {
 }
 
 // ------------------------------------------------------------------ 聊天
+let streaming = null;              // 正在飞的流：{ctl, cid}；非空时发送键变「停止」
+
+// 一帧的正文：后端发的是 "data: {...}\n\n"
+function parseFrame(frame) {
+  for (const line of frame.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const body = line.slice(5).trim();
+    if (!body) continue;
+    try { return JSON.parse(body); } catch (e) { return null; }
+  }
+  return null;
+}
+
+function setSending(on) {
+  const btn = $("#btn-send");
+  btn.classList.toggle("stop", on);
+  btn.textContent = on ? "■" : "↑";
+  btn.setAttribute("aria-label", on ? "停止" : "发送");
+}
+
 async function send() {
   const q = $("#question").value.trim();
   if (!q) return;
   if (!select.value) { addMessage("error", "还没有可用的课件，先点右上角「更新」渲染。"); return; }
+  if (streaming) return;                       // 正在回答，别叠着发
+
+  const p = livePage();
+  const lid = select.value;
+  const conv = ensureConv();
+  const cid = conv.id;
+  // 发给模型的是**本轮之前**的内容。本轮的课件上下文由后端按当前页现拼，不进历史 ——
+  // 存进去的话用户一翻页就会拿着旧页的全文去问。
+  const history = conv.messages.map((m) => ({ role: m.role, content: m.content }));
 
   addMessage("user", q);
   $("#question").value = "";
-  $("#btn-send").disabled = true;
+  conv.messages.push({ role: "user", content: q, page: p ? p.page : null });
 
-  const p = livePage();
-  const loading = addMessage("assistant", "思考中…");
+  const el = addMessage("assistant", "");
+  el.classList.add("streaming");
+  const inner = el.querySelector(".markdown");
+
+  const ctl = new AbortController();
+  streaming = { ctl, cid };
+  setSending(true);
+
+  let answer = "";
+  let sawStream = false;                       // 收到过响应头 —— 后端从这一刻起才开始记这轮
+  let stopped = false;
+  let failed = null;
+  let stick = true;
+  let timer = null;
+  let lastPaint = 0;
+
+  // 每来一小段就把整段重跑一遍 md()。KaTeX 有记忆化，markdown 正则本身是亚毫秒级，
+  // 所以真正的成本是 layout —— 用 70ms 的节流压住，done 时再来一次收尾。
+  function paint(force) {
+    if (!force) {
+      const now = performance.now();
+      if (now - lastPaint < 70) {
+        if (!timer) timer = setTimeout(() => { timer = null; paint(true); }, 70);
+        return;
+      }
+    }
+    lastPaint = performance.now();
+    stick = nearBottom();
+    inner.innerHTML = md(balanced(answer));
+    if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
   try {
-    const r = await api("/api/chat", {
+    const res = await fetch("/api/chat/stream", {
       method: "POST",
-      body: { lecture: select.value, page: p ? p.page : null, question: q },
+      headers: { "Content-Type": "application/json" },
+      signal: ctl.signal,
+      body: JSON.stringify({
+        lecture: lid, page: p ? p.page : null, question: q, cid, history,
+      }),
     });
-    loading.remove();
-    if (r.error) addMessage("error", "出错了：" + r.error);
-    else addMessage("assistant", r.answer || "（空回答）");
+    if (!res.ok || !res.body) {
+      // 后端在发响应头之前就失败了（没填 key、地址不对、401…），回的是普通 JSON
+      let msg = "HTTP " + res.status;
+      try {
+        const j = await res.json();
+        if (j && j.error) msg = j.error;
+      } catch (e) { /* 不是 JSON 就用状态码 */ }
+      throw new Error(msg);
+    }
+    sawStream = true;
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;                         // 一定要读到 EOF：title 帧在 done 之后才发
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        const ev = parseFrame(buf.slice(0, cut));
+        buf = buf.slice(cut + 2);
+        if (!ev) continue;
+        if (ev.type === "delta") { answer += ev.content; paint(false); }
+        else if (ev.type === "error") throw new Error(ev.error);
+        else if (ev.type === "title") {
+          conv.title = ev.title;
+          if (!historyPop.hidden) renderHistory();
+        }
+      }
+    }
   } catch (e) {
-    loading.remove();
-    addMessage("error", "请求失败：" + e.message);
+    if (e.name === "AbortError") stopped = true;
+    else failed = e;
   } finally {
-    $("#btn-send").disabled = false;
+    if (timer) clearTimeout(timer);
+    if (failed) {
+      // 这轮后端什么都没记（它是在发响应头之后才开始记的），本地也退回原样，
+      // 否则界面和磁盘上的历史会对不上
+      if (!sawStream) conv.messages.pop();
+      el.remove();
+      addMessage("error", "出错了：" + failed.message);
+    } else {
+      // 收尾用原文而不是 balanced() 补过的：真闭合符没到就不该在最后留下一个假的
+      inner.innerHTML = md(answer || (stopped ? "" : "（空回答）"));
+      if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
+      el.classList.remove("streaming");
+      if (answer) {
+        const msg = { role: "assistant", content: answer };
+        if (stopped) { msg.stopped = true; el.appendChild(stoppedMark()); }
+        conv.messages.push(msg);
+      } else if (stopped) {
+        el.remove();                           // 一个字都没收到，别留个空气泡
+        if (!sawStream) conv.messages.pop();
+      }
+    }
+    streaming = null;
+    setSending(false);
     $("#question").focus();
   }
+}
+
+// ------------------------------------------------------------------ 历史
+// 对话按讲分开：切换讲次时整个换一份列表，上一讲的记录不该留在眼前。
+// 「当前对话」只活在内存里，每次提问把它之前的内容当历史发给后端；后端那边才是真源。
+let currentConv = null;            // {id, title, messages[]}；null = 还没开始的新对话
+let historyCache = [];
+const historyPop = $("#history-pop");
+
+function newId() {
+  // 对话 id 由前端生成：第一帧到达之前界面就得把它建好并选中
+  try {
+    return crypto.randomUUID();
+  } catch (e) {
+    return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+}
+
+function ensureConv() {
+  if (!currentConv) currentConv = { id: newId(), title: "", messages: [] };
+  return currentConv;
+}
+
+function showConversation(conv) {
+  messagesEl.innerHTML = "";
+  currentConv = {
+    id: conv.id,
+    title: conv.title || "",
+    messages: (conv.messages || []).slice(),
+  };
+  for (const m of currentConv.messages) {
+    if (m.role === "user") addMessage("user", m.content);
+    else {
+      const el = addMessage("assistant", m.content);
+      if (m.stopped) el.appendChild(stoppedMark());
+    }
+  }
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// 切讲时调用。在飞的流要掐掉 —— 后端会把已经收到的部分存下来，不会丢。
+function resetChat() {
+  if (streaming) streaming.ctl.abort();
+  currentConv = null;
+  messagesEl.innerHTML = "";
+  if (!historyPop.hidden) loadHistoryList().then(renderHistory);
+}
+
+function relTime(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return "刚刚";
+  if (s < 3600) return Math.floor(s / 60) + " 分钟前";
+  if (s < 86400) return Math.floor(s / 3600) + " 小时前";
+  if (s < 86400 * 30) return Math.floor(s / 86400) + " 天前";
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+async function loadHistoryList() {
+  if (!select.value) { historyCache = []; return; }
+  try {
+    const r = await api("/api/history/list", {
+      method: "POST",
+      body: { lecture: select.value },
+    });
+    historyCache = r.conversations || [];
+  } catch (e) {
+    historyCache = [];
+  }
+}
+
+function renderHistory() {
+  const box = $("#history-list");
+  box.innerHTML = "";
+  if (!historyCache.length) {
+    box.innerHTML = '<div class="hist-empty">这一讲还没有对话</div>';
+    return;
+  }
+  for (const c of historyCache) {
+    const row = document.createElement("div");
+    row.className = "hist-row" + (currentConv && currentConv.id === c.id ? " active" : "");
+
+    const text = document.createElement("div");
+    text.className = "hist-text";
+    const title = document.createElement("div");
+    title.className = "hist-title";
+    title.textContent = c.title || "新对话";
+    const time = document.createElement("div");
+    time.className = "hist-time";
+    time.textContent = relTime(c.updated) + (c.count ? " · " + c.count + " 条" : "");
+    text.append(title, time);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "hist-del";
+    del.textContent = "×";
+    del.setAttribute("aria-label", "删除这条对话");
+    del.addEventListener("click", (e) => { e.stopPropagation(); removeConversation(c.id); });
+
+    row.append(text, del);
+    row.addEventListener("click", () => openConversation(c.id));
+    box.appendChild(row);
+  }
+}
+
+async function openConversation(id) {
+  try {
+    const r = await api("/api/history/get", {
+      method: "POST",
+      body: { lecture: select.value, id },
+    });
+    if (!r.conversation) {          // 列表过期了（比如在别处删过），刷新一下
+      await loadHistoryList();
+      renderHistory();
+      return;
+    }
+    showConversation(r.conversation);
+    closeHistory();
+  } catch (e) { /* 读不到就维持现状 */ }
+}
+
+async function removeConversation(id) {
+  try {
+    await api("/api/history/delete", {
+      method: "POST",
+      body: { lecture: select.value, id },
+    });
+  } catch (e) { /* 删不掉就当没删 */ }
+  if (currentConv && currentConv.id === id) {
+    currentConv = null;
+    messagesEl.innerHTML = "";
+  }
+  await loadHistoryList();
+  renderHistory();
+}
+
+function openHistory() {
+  historyPop.hidden = false;
+  loadHistoryList().then(renderHistory);
+}
+
+function closeHistory() {
+  historyPop.hidden = true;
 }
 
 // ------------------------------------------------------------------ 划词引用
@@ -676,11 +1115,36 @@ async function saveSettings() {
 select.addEventListener("change", () => openLecture(select.value));
 $("#chat-form").addEventListener("submit", (e) => {
   e.preventDefault();
+  if (streaming) { streaming.ctl.abort(); return; }   // 流式期间这个键是「停止」
   if (mode === "search") doSearch();
   else send();
 });
 $("#question").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (mode === "search") doSearch(); else send(); }
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (streaming) return;                            // 停不下来，等它自己结束
+    if (mode === "search") doSearch();
+    else send();
+  }
+});
+// 历史浮层
+$("#btn-history").addEventListener("click", () => {
+  if (historyPop.hidden) openHistory(); else closeHistory();
+});
+$("#btn-new-conv").addEventListener("click", () => {
+  currentConv = null;
+  messagesEl.innerHTML = "";
+  closeHistory();
+});
+$("#history-pop").addEventListener("mousedown", (e) => e.stopPropagation());
+// 点浮层外面收起来。contextmenu 那块也挂了 mousedown，两者互不影响
+document.addEventListener("mousedown", (e) => {
+  if (historyPop.hidden) return;
+  if (e.target === $("#btn-history")) return;
+  closeHistory();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !historyPop.hidden) closeHistory();
 });
 for (const t of document.querySelectorAll(".tab")) {
   t.addEventListener("click", () => setMode(t.dataset.mode));

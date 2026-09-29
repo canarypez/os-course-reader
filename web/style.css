@@ -135,6 +135,13 @@ button:active:not(:disabled) { background: var(--panel-2); }
 button:disabled { opacity: .45; cursor: default; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+/* 不抢视线的次级按钮（历史、新对话） */
+button.ghost {
+  padding: 4px 9px; border-color: transparent; background: none; color: var(--muted);
+}
+button.ghost:hover:not(:disabled) {
+  background: var(--hover); border-color: transparent; color: var(--text);
+}
 
 select {
   padding: 6px 10px;
@@ -189,6 +196,7 @@ select {
 
 /* ---------- 聊天侧栏 ---------- */
 .chat {
+  position: relative;          /* 历史浮层挂在它下面 */
   flex: none;
   width: var(--chat-w, 440px);
   min-width: 280px;
@@ -218,6 +226,54 @@ select {
   background: var(--seg-on); color: var(--text); font-weight: 600;
   box-shadow: 0 1px 2px rgba(0, 0, 0, .07);
 }
+
+/* 历史浮层：非模态，从「历史」按钮下方展开，点外面就收 */
+.history-pop {
+  position: absolute;
+  top: 42px;
+  right: 8px;
+  z-index: 20;
+  width: min(300px, calc(100% - 16px));
+  max-height: min(420px, 70vh);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.hist-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px 7px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.hist-cap { font-size: 12px; color: var(--muted); }
+.hist-list { overflow-y: auto; padding: 4px; }
+.hist-empty { padding: 14px 10px; font-size: 13px; color: var(--muted); text-align: center; }
+.hist-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.hist-row:hover { background: var(--hover); }
+.hist-row.active { background: var(--accent-soft); }
+.hist-text { flex: 1; min-width: 0; }
+.hist-title {
+  font-size: 13px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hist-time { font-size: 11px; color: var(--muted); margin-top: 1px; }
+.hist-del {
+  flex: none; width: 22px; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 14px; line-height: 1;
+  border-color: transparent; background: none; color: var(--muted); opacity: 0;
+}
+.hist-row:hover .hist-del { opacity: 1; }
+.hist-del:hover:not(:disabled) { background: var(--danger-bg); color: var(--danger); border-color: transparent; }
+.hist-del:focus-visible { opacity: 1; }
 
 .messages {
   flex: 1;
@@ -267,6 +323,19 @@ select {
   margin: 0 0 10px; padding: 2px 0 2px 10px;
   border-left: 2px solid var(--border-strong); color: var(--muted);
 }
+/* display:block + overflow 是让宽表格在窄侧栏里横向滚动的常规做法；
+   单元格仍是表格布局，列宽照常分配 */
+.msg.assistant table {
+  display: block; overflow-x: auto; max-width: 100%;
+  border-collapse: collapse; margin: 0 0 10px; font-size: 13px;
+}
+.msg.assistant th, .msg.assistant td {
+  border: 1px solid var(--border); padding: 5px 9px; text-align: left;
+  vertical-align: top;
+}
+.msg.assistant th { background: var(--panel-2); font-weight: 600; }
+.msg.assistant h4 { font-size: 13px; }
+.msg.assistant del { color: var(--muted); }
 .msg.assistant code {
   background: var(--code-bg); color: var(--code-text);
   padding: 1px 5px; border-radius: 4px;
@@ -283,6 +352,23 @@ select {
 }
 .msg.assistant .katex { font-size: 1.05em; }
 .msg.assistant .katex-display { margin: 10px 0; padding: 2px 0; overflow-x: auto; overflow-y: hidden; }
+
+/* 流式输出时行尾的方块光标。挂在最后一个块级子元素上，才会跟着正文走而不是另起一行 */
+.msg.assistant.streaming .markdown > *:last-child::after,
+.msg.assistant.streaming .markdown:empty::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 3px;
+  vertical-align: -2px;
+  background: var(--accent);
+  animation: caret-blink 1.1s steps(2, start) infinite;
+}
+@keyframes caret-blink { 0%, 50% { opacity: .85; } 50.01%, 100% { opacity: 0; } }
+
+/* 用户点了停止：留下的半截回答标明一下 */
+.msg-stopped { display: block; margin-top: 6px; font-size: 12px; color: var(--muted); }
 
 /* ---------- 检索结果 ---------- */
 .results {

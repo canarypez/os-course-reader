@@ -47,7 +47,18 @@
           <button type="button" class="tab active" data-mode="ask" role="tab">问答</button>
           <button type="button" class="tab" data-mode="search" role="tab">检索</button>
         </div>
+        <div class="spacer"></div>
+        <button type="button" id="btn-history" class="ghost">历史</button>
       </div>
+      <!-- 历史：非模态小浮层。对话按讲分，所以这里只列当前讲的那一份 -->
+      <div id="history-pop" class="history-pop" hidden>
+        <div class="hist-head">
+          <span class="hist-cap">历史对话</span>
+          <button type="button" id="btn-new-conv" class="ghost">新对话</button>
+        </div>
+        <div id="history-list" class="hist-list"></div>
+      </div>
+
       <div id="messages" class="messages"></div>
       <div id="results" class="results" hidden></div>
       <form id="chat-form" class="chat-input">

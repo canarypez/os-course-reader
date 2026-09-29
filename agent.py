@@ -324,6 +324,45 @@ def build_context(store: CourseStore, lid, pid, question, max_retrieve):
     return "\n\n".join(parts)
 
 
+def _history_messages(history, budget):
+    """把历史轮次裁进字符预算，返回能直接拼进 messages 的列表。
+
+    从最旧的开始丢。只剩一轮还超预算时**截断那一轮的回答而不是整轮丢掉** —— 丢掉的话
+    这轮提问就凭空消失了，模型会以为用户压根没问过。
+    """
+    turns = []
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        role = h.get("role")
+        content = str(h.get("content") or "")
+        if role in ("user", "assistant") and content:
+            turns.append({"role": role, "content": content})
+
+    used = sum(len(m["content"]) for m in turns)
+    while turns and used > budget:
+        if len(turns) == 1:
+            turns[0]["content"] = (turns[0]["content"][:max(200, budget)]
+                                   + "\n…（前文过长，已截断）")
+            break
+        used -= len(turns[0]["content"])
+        turns.pop(0)
+    return turns
+
+
+def build_messages(config: dict, store: CourseStore, lid, pid, question, history=None):
+    """拼这次请求的消息列表。一次性问答与流式共用 —— 两处各写一份 prompt 迟早走偏。
+
+    课件上下文只跟着「这一问」走，不进历史：它每轮都得按当时的页重新拼，存进历史既会
+    反复撑大请求，也会在用户翻页之后拿旧页的全文去骗模型。
+    """
+    ctx = build_context(store, lid, pid, question, int(config.get("max_retrieve", 4)))
+    msgs = [{"role": "system", "content": config.get("system_prompt") or DEFAULT_SYSTEM}]
+    msgs.extend(_history_messages(history, int(config.get("history_budget", 12000))))
+    msgs.append({"role": "user", "content": ctx + "\n\n【学生的问题】\n" + question})
+    return msgs
+
+
 # --------------------------------------------------------------------------- LLM 调用
 #: 常见状态码对应的「人话」，直接拼进错误里 —— 用户看到 404 不知道是路径还是模型的问题
 _HINT = {
@@ -509,25 +548,19 @@ def test_connection(config: dict) -> dict:
     return {**out, "ok": True, "detail": f"HTTP {resp.status_code}，{model} 可用"}
 
 
-def ask(config: dict, store: CourseStore, lid, pid, question):
-    api_key = (config.get("api_key") or "").strip()
-    model = (config.get("model") or "deepseek-chat").strip()
+def _require(config: dict):
+    """提问前的两项硬检查。一次性问答与流式共用，免得两处报错还不一样。"""
     if not (config.get("api_base") or "").strip():
         raise RuntimeError("未配置 API Base URL，请在「设置」里填写。")
-    if not api_key:
+    if not (config.get("api_key") or "").strip():
         raise RuntimeError("未配置 API Key，请在「设置」里填写。")
 
-    ctx = build_context(store, lid, pid, question, int(config.get("max_retrieve", 4)))
-    system = config.get("system_prompt") or DEFAULT_SYSTEM
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": ctx + "\n\n【学生的问题】\n" + question},
-    ]
-
+def ask(config: dict, store: CourseStore, lid, pid, question, history=None):
+    _require(config)
     payload = {
-        "model": model,
-        "messages": messages,
+        "model": (config.get("model") or "deepseek-chat").strip(),
+        "messages": build_messages(config, store, lid, pid, question, history),
         "stream": False,
         "temperature": 0.3,
     }
@@ -543,3 +576,141 @@ def ask(config: dict, store: CourseStore, lid, pid, question):
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise RuntimeError("API 响应格式异常：" + json.dumps(data, ensure_ascii=False)[:300])
+
+
+# --------------------------------------------------------------------------- 流式
+def _frame_text(frame: str) -> str:
+    """一个 SSE 帧 → 增量文本。心跳、空 delta、[DONE] 一律跳过。
+
+    只认 `delta.content`：deepseek-reasoner 那类会把思维链放在 `reasoning_content`
+    里，接进来就成了把模型的草稿当答案显示给用户。
+    """
+    for line in frame.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        body = line[5:].strip()
+        if not body or body == "[DONE]":
+            continue
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            continue
+        try:
+            delta = obj["choices"][0]["delta"]
+        except (KeyError, IndexError, TypeError):
+            continue
+        text = (delta or {}).get("content")
+        if text:
+            return text
+    return ""
+
+
+def _whole_body(resp) -> str:
+    """对方无视 `stream: true`、直接回了整段 JSON 时的降级路径。
+
+    行为退化成「一次性」，但至少不报错 —— new-api 系的站对 stream 的支持参差不齐，
+    这条路上不能把好好的一个回答变成一条错误。
+    """
+    resp.read()
+    raw = resp.text or ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    try:
+        return data["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return json.dumps(data, ensure_ascii=False)[:2000]
+
+
+def _iter_deltas(resp):
+    """把一条流式响应拆成增量文本。
+
+    按 `\\n\\n` 切帧，不用 `iter_lines()`：中转站发的行尾可能是 `\\r\\n`，按行切会把
+    空行也算一行，帧边界就飘了。
+    """
+    if "text/event-stream" not in (resp.headers.get("content-type") or "").lower():
+        text = _whole_body(resp)
+        if text:
+            yield text
+        return
+
+    buf = ""
+    for chunk in resp.iter_bytes():
+        buf += chunk.decode("utf-8", "replace")
+        while "\n\n" in buf:
+            frame, buf = buf.split("\n\n", 1)
+            text = _frame_text(frame)
+            if text:
+                yield text
+    if buf.strip():                       # 最后一帧可能没有收尾的空行
+        text = _frame_text(buf)
+        if text:
+            yield text
+
+
+def stream_chat(config: dict, store: CourseStore, lid, pid, question, history=None):
+    """流式提问，逐段产出文本。
+
+    只有 404 才换下一个候选地址（和 `_request` 的语义一致）；连不上、401、读超时都
+    直接抛 —— 那是这个地址本身的毛病，换个地址也一样。
+    """
+    _require(config)
+    payload = {
+        "model": (config.get("model") or "deepseek-chat").strip(),
+        "messages": build_messages(config, store, lid, pid, question, history),
+        "stream": True,
+        "temperature": 0.3,
+    }
+    urls = chat_urls(config.get("api_base"))
+    if not urls:
+        raise RuntimeError("未配置 API Base URL，请在「设置」里填写。")
+    key = config.get("api_key")
+    timeout = httpx.Timeout(180.0, connect=30.0)
+    for i, url in enumerate(urls):
+        try:
+            with httpx.stream("POST", url, headers=_headers(key), json=payload,
+                              timeout=timeout) as r:
+                if r.status_code == 404 and i + 1 < len(urls):
+                    continue              # with 退出时响应已关闭，可以安全换地址
+                if r.status_code >= 400:
+                    r.read()
+                    raise RuntimeError(_explain(r))
+                yield from _iter_deltas(r)
+                return
+        except UnicodeEncodeError:
+            raise RuntimeError(
+                "API Key 或 Base URL 里混进了非 ASCII 字符（比如把设置里打码显示的 "
+                "••••1234 原样存了下来）。到「设置」里把 API Key 重新填一遍即可。")
+        except httpx.HTTPError as e:
+            raise RuntimeError(_net_error(url, e)) from e
+
+
+def generate_title(config: dict, question: str, answer: str):
+    """给这轮对话起个短名字。失败返回 None，调用方用问题前 10 字兜底。
+
+    单独发一次小请求、15s 封顶：起名不值得让用户多等，失败了也不影响已经拿到的回答。
+    """
+    prompt = ("给下面这轮问答起个标题，6-14 个字，直接输出标题本身，"
+              "不要引号、不要标点结尾、不要任何解释。\n\n"
+              f"【问】{question[:500]}\n【答】{answer[:1500]}")
+    payload = {
+        "model": (config.get("model") or "deepseek-chat").strip(),
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "temperature": 0.3,
+        "max_tokens": 32,
+    }
+    try:
+        _, resp = post_chat(config, payload, timeout=15.0)
+    except (RuntimeError, httpx.HTTPError):
+        return None
+    if resp.status_code >= 400:
+        return None
+    try:
+        text = resp.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    title = " ".join((text or "").split()).strip("《》“”\"'‘’。.、,，:：;；")
+    return title[:20] or None

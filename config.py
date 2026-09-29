@@ -46,6 +46,8 @@ DEFAULTS = {
     "chat_width": 440,
     # 主题：system = 跟随 Windows，light / dark = 强制
     "theme": "system",
+    # 多轮对话里往回带多少字符的旧消息（超了从最旧的开始丢）
+    "history_budget": 12000,
 }
 
 
